@@ -689,4 +689,162 @@ var _ = Describe("Node Controller", func() {
 			}, time.Second*5).Should(BeTrue(), "NodeEvaluation should be updated with new condition and taint status")
 		})
 	})
+
+	// Test for dry-run consistency (Issue #54)
+	Context("when a node changes and a dry-run rule exists", func() {
+		var (
+			ctx                 context.Context
+			readinessController *RuleReadinessController
+			nodeReconciler      *NodeReconciler
+			fakeClientset       *fake.Clientset
+			node                *corev1.Node
+			rule                *nodereadinessiov1alpha1.NodeReadinessRule
+			namespacedName      types.NamespacedName
+		)
+
+		BeforeEach(func() {
+			ctx = context.Background()
+
+			fakeClientset = fake.NewSimpleClientset()
+			readinessController = &RuleReadinessController{
+				Client:        k8sClient,
+				Scheme:        k8sClient.Scheme(),
+				clientset:     fakeClientset,
+				ruleCache:     make(map[string]*nodereadinessiov1alpha1.NodeReadinessRule),
+				EventRecorder: record.NewFakeRecorder(10),
+			}
+
+			nodeReconciler = &NodeReconciler{
+				Client:     k8sClient,
+				Scheme:     k8sClient.Scheme(),
+				Controller: readinessController,
+			}
+
+			namespacedName = types.NamespacedName{Name: "dryrun-node"}
+
+			node = &corev1.Node{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:   "dryrun-node",
+					Labels: map[string]string{"test-group": "dryrun"},
+				},
+				Spec: corev1.NodeSpec{
+					Taints: []corev1.Taint{},
+				},
+				Status: corev1.NodeStatus{
+					Conditions: []corev1.NodeCondition{
+						{Type: "DryRunCondition", Status: corev1.ConditionFalse},
+					},
+				},
+			}
+
+			rule = &nodereadinessiov1alpha1.NodeReadinessRule{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:       "dryrun-rule",
+					Finalizers: []string{finalizerName},
+				},
+				Spec: nodereadinessiov1alpha1.NodeReadinessRuleSpec{
+					Conditions: []nodereadinessiov1alpha1.ConditionRequirement{
+						{Type: "DryRunCondition", RequiredStatus: corev1.ConditionTrue},
+					},
+					Taint: corev1.Taint{
+						Key:    "readiness.k8s.io/dryrun-taint",
+						Effect: corev1.TaintEffectNoSchedule,
+					},
+					NodeSelector: metav1.LabelSelector{
+						MatchLabels: map[string]string{"test-group": "dryrun"},
+					},
+					EnforcementMode: nodereadinessiov1alpha1.EnforcementModeContinuous,
+					DryRun:          true,
+				},
+			}
+		})
+
+		JustBeforeEach(func() {
+			Expect(k8sClient.Create(ctx, node)).To(Succeed())
+			Expect(k8sClient.Create(ctx, rule)).To(Succeed())
+
+			readinessController.updateRuleCache(ctx, rule)
+		})
+
+		AfterEach(func() {
+			_ = k8sClient.Delete(ctx, node)
+
+			updatedRule := &nodereadinessiov1alpha1.NodeReadinessRule{}
+			if err := k8sClient.Get(ctx, types.NamespacedName{Name: "dryrun-rule"}, updatedRule); err == nil {
+				updatedRule.Finalizers = nil
+				_ = k8sClient.Update(ctx, updatedRule)
+				_ = k8sClient.Delete(ctx, updatedRule)
+			}
+
+			Eventually(func() bool {
+				err := k8sClient.Get(ctx, types.NamespacedName{Name: "dryrun-rule"}, &nodereadinessiov1alpha1.NodeReadinessRule{})
+				return apierrors.IsNotFound(err)
+			}, time.Second*10).Should(BeTrue())
+
+			readinessController.removeRuleFromCache(ctx, "dryrun-rule")
+		})
+
+		It("should update DryRunResults when node conditions change", func() {
+			By("Reconciling node with unsatisfied condition")
+			_, err := nodeReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: namespacedName})
+			Expect(err).NotTo(HaveOccurred())
+
+			By("Verifying DryRunResults show taint would be added")
+			Eventually(func() *int32 {
+				updatedRule := &nodereadinessiov1alpha1.NodeReadinessRule{}
+				if err := k8sClient.Get(ctx, types.NamespacedName{Name: "dryrun-rule"}, updatedRule); err != nil {
+					return nil
+				}
+				return updatedRule.Status.DryRunResults.TaintsToAdd
+			}, time.Second*5).ShouldNot(BeNil())
+
+			updatedRule := &nodereadinessiov1alpha1.NodeReadinessRule{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "dryrun-rule"}, updatedRule)).To(Succeed())
+			Expect(*updatedRule.Status.DryRunResults.TaintsToAdd).To(Equal(int32(1)),
+				"Dry run should report 1 taint to add when condition is not satisfied")
+			Expect(*updatedRule.Status.DryRunResults.TaintsToRemove).To(Equal(int32(0)))
+
+			By("Updating node condition to satisfied")
+			updatedNode := &corev1.Node{}
+			Expect(k8sClient.Get(ctx, namespacedName, updatedNode)).To(Succeed())
+			updatedNode.Status.Conditions[0].Status = corev1.ConditionTrue
+			Expect(k8sClient.Status().Update(ctx, updatedNode)).To(Succeed())
+
+			By("Reconciling again after condition change")
+			_, err = nodeReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: namespacedName})
+			Expect(err).NotTo(HaveOccurred())
+
+			By("Verifying DryRunResults updated to reflect no changes needed")
+			Eventually(func() bool {
+				freshRule := &nodereadinessiov1alpha1.NodeReadinessRule{}
+				if err := k8sClient.Get(ctx, types.NamespacedName{Name: "dryrun-rule"}, freshRule); err != nil {
+					return false
+				}
+				return freshRule.Status.DryRunResults.TaintsToAdd != nil &&
+					*freshRule.Status.DryRunResults.TaintsToAdd == 0 &&
+					freshRule.Status.DryRunResults.TaintsToRemove != nil &&
+					*freshRule.Status.DryRunResults.TaintsToRemove == 0
+			}, time.Second*5).Should(BeTrue(),
+				"Dry run results should update when node conditions change")
+		})
+
+		It("should not modify taints on the node", func() {
+			By("Reconciling with unsatisfied condition")
+			_, err := nodeReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: namespacedName})
+			Expect(err).NotTo(HaveOccurred())
+
+			By("Verifying no taint was added to the node")
+			Consistently(func() bool {
+				updatedNode := &corev1.Node{}
+				_ = k8sClient.Get(ctx, namespacedName, updatedNode)
+				for _, taint := range updatedNode.Spec.Taints {
+					if taint.Key == "readiness.k8s.io/dryrun-taint" {
+						return true
+					}
+				}
+				return false
+			}, time.Second*2).Should(BeFalse(),
+				"Dry run rule should never modify taints on the node")
+		})
+	})
 })

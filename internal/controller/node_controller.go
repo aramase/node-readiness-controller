@@ -131,10 +131,18 @@ func (r *RuleReadinessController) processNodeAgainstAllRules(ctx context.Context
 			continue
 		}
 
-		// Skip if dry run
+		// Handle dry run: re-evaluate all nodes and update DryRunResults
 		if rule.Spec.DryRun {
-			log.Info("Skipping rule - dry run mode",
+			log.Info("Re-evaluating dry run rule after node change",
 				"node", node.Name, "rule", rule.Name)
+
+			if err := r.processDryRun(ctx, rule); err != nil {
+				log.Error(err, "Failed to process dry run for rule",
+					"node", node.Name, "rule", rule.Name)
+			} else if err := r.updateRuleStatus(ctx, rule); err != nil {
+				log.Error(err, "Failed to update dry run rule status",
+					"node", node.Name, "rule", rule.Name)
+			}
 			continue
 		}
 
